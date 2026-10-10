@@ -1,0 +1,19 @@
+server:
+  port: ${SERVER_PORT:8091}
+
+spring:
+  application:
+    name: worker-node
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,metrics
+
+worker:
+  id: ${WORKER_ID:worker-local}
+  host: ${WORKER_HOST:localhost}                  # address the scheduler uses to reach this worker
+  capacity: ${WORKER_CAPACITY:4}                  # max concurrent jobs
+  scheduler-urls: ${SCHEDULER_URLS:http://localhost:8081,http://localhost:8082}
+  heartbeat-interval-ms: ${HEARTBEAT_INTERVAL_MS:3000}

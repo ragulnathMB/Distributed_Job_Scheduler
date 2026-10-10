@@ -1,23 +1,4 @@
-# Maven / Java
-/target/
-!.mvn/wrapper/maven-wrapper.jar
-
-# IDE files
-.idea/
+target/
 *.iml
+.idea/
 .vscode/
-
-# OS files
-.DS_Store
-Thumbs.db
-
-# Logs
-*.log
-
-# Environment files
-.env
-*.env
-
-# Temporary files
-*.tmp
-*.temp

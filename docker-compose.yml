@@ -1,15 +1,102 @@
-services:
-  postgres:
-    image: postgres:16-alpine
-    container_name: jobscheduler-pg
-    environment:
-      POSTGRES_DB: jobscheduler
-      POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: postgres
-    ports:
-      - "5432:5432"
-    volumes:
-      - jobscheduler-pgdata:/var/lib/postgresql/data
 
-volumes:
-  jobscheduler-pgdata:
+  name: distributed-job-scheduler
+
+  services:
+    postgres:
+      image: postgres:16-alpine
+      environment:
+        POSTGRES_DB: scheduler
+        POSTGRES_USER: scheduler
+        POSTGRES_PASSWORD: scheduler
+      ports:
+        - "5432:5432"
+      volumes:
+        - pgdata:/var/lib/postgresql/data
+      healthcheck:
+        test: ["CMD-SHELL", "pg_isready -U scheduler -d scheduler"]
+        interval: 3s
+        timeout: 3s
+        retries: 20
+
+    scheduler-1:
+      build:
+        context: .
+        args:
+          MODULE: scheduler
+      image: jobscheduler/scheduler:latest
+      environment:
+        NODE_ID: scheduler-1
+        SERVER_PORT: "8081"
+        DB_URL: jdbc:postgresql://postgres:5432/scheduler
+        DB_USER: scheduler
+        DB_PASSWORD: scheduler
+      ports:
+        - "8081:8081"
+      depends_on:
+        postgres:
+          condition: service_healthy
+      restart: on-failure
+
+    scheduler-2:
+      image: jobscheduler/scheduler:latest
+      environment:
+        NODE_ID: scheduler-2
+        SERVER_PORT: "8082"
+        DB_URL: jdbc:postgresql://postgres:5432/scheduler
+        DB_USER: scheduler
+        DB_PASSWORD: scheduler
+      ports:
+        - "8082:8082"
+      depends_on:
+        postgres:
+          condition: service_healthy
+        scheduler-1:
+          condition: service_started
+      restart: on-failure
+
+    worker-1:
+      build:
+        context: .
+        args:
+          MODULE: worker
+      image: jobscheduler/worker:latest
+      environment: &worker-env
+        SCHEDULER_URLS: http://scheduler-1:8081,http://scheduler-2:8082
+        WORKER_CAPACITY: "4"
+        WORKER_ID: worker-1
+        WORKER_HOST: worker-1
+        SERVER_PORT: "8091"
+      ports:
+        - "8091:8091"
+      depends_on:
+        - scheduler-1
+      restart: "no"
+
+    worker-2:
+      image: jobscheduler/worker:latest
+      environment:
+        <<: *worker-env
+        WORKER_ID: worker-2
+        WORKER_HOST: worker-2
+        SERVER_PORT: "8092"
+      ports:
+        - "8092:8092"
+      depends_on:
+        - scheduler-1
+      restart: "no"
+
+    worker-3:
+      image: jobscheduler/worker:latest
+      environment:
+        <<: *worker-env
+        WORKER_ID: worker-3
+        WORKER_HOST: worker-3
+        SERVER_PORT: "8093"
+      ports:
+        - "8093:8093"
+      depends_on:
+        - scheduler-1
+      restart: "no"
+
+  volumes:
+    pgdata:

@@ -1,0 +1,25 @@
+server:
+  port: ${SERVER_PORT:8081}
+
+spring:
+  application:
+    name: scheduler-node
+  datasource:
+    url: ${DB_URL:jdbc:postgresql://localhost:5432/scheduler}
+    username: ${DB_USER:scheduler}
+    password: ${DB_PASSWORD:scheduler}
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,metrics
+
+scheduler:
+  node-id: ${NODE_ID:scheduler-local}
+  leader-lease-seconds: ${LEADER_LEASE_SECONDS:10}     # leader must renew within this window
+  poll-interval-ms: ${POLL_INTERVAL_MS:1000}           # election renew + dispatch tick
+  job-lease-grace-seconds: 15                          # job lease = job timeout + grace
+  worker-dead-after-seconds: ${WORKER_DEAD_AFTER_SECONDS:15}
+  dispatch-batch-size: 50
+  max-backoff-seconds: 300

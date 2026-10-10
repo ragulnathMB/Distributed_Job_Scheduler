@@ -1,272 +1,159 @@
-# Distributed Job Scheduler
- 
-A production-inspired, distributed job scheduler built with Spring Boot and PostgreSQL. It supports one-time, delayed, recurring, and cron-based jobs, with priority-based dispatch, automatic retries with exponential backoff, crash recovery, and lease-based leader election across multiple scheduler nodes.
- 
-This project is designed as an educational but realistic reference implementation of the core mechanics behind systems like Quartz, Airflow, or a lightweight Temporal — the kind of distributed-systems concepts that come up in backend design interviews.
- 
-## Features
- 
-- **Multiple job types** — one-time, delayed, fixed-interval recurring, and cron-scheduled jobs
-- **Priority-based dispatch** — jobs are ordered by priority (and then by due time) before being handed to workers
-- **Distributed leader election** — only one scheduler node polls and dispatches at a time, using a lease-based conditional update against PostgreSQL (no ZooKeeper/etcd required)
-- **Optimistic job claiming** — nodes claim due jobs via a conditional UPDATE, preventing double-dispatch across the cluster
-- **Crash recovery** — jobs whose lease expires without completing are automatically reset to `PENDING` and picked back up
-- **Retry with exponential backoff** — failed jobs are retried with a capped, doubling backoff; jobs that exhaust their retries move to a terminal `FAILED` ("dead letter") state
-- **Execution history** — every attempt is recorded as an append-only `job_executions` row, queryable per job
-- **Worker registry and heartbeats** — worker nodes register, send heartbeats, and are marked `DEAD` if they go silent
-- **REST API** — full CRUD and lifecycle control (create, cancel, pause, resume) plus monitoring endpoints
-- **Database-backed state** — Postgres is the single source of truth for job state, leases, and leadership; schema is version-controlled with Flyway
-## Architecture
- 
+# Distributed Job Scheduler (Spring Boot + PostgreSQL + Docker)
+
+A small but realistic distributed job scheduler. Several **scheduler nodes** share one PostgreSQL database and elect
+a single **leader** with a lease; the leader polls for due jobs and pushes them to **worker nodes**, each running
+on its own port. No ZooKeeper / etcd / Redis / Kafka needed.
+
 ```
-                    ┌─────────────────────┐
-                    │   JobController      │  REST API (create/cancel/pause/resume/history)
-                    └──────────┬───────────┘
-                               │
-                    ┌──────────▼───────────┐
-                    │     JobService        │  Job CRUD + lifecycle
-                    └──────────┬───────────┘
-                               │
-        ┌──────────────────────▼───────────────────────┐
-        │              PostgreSQL (jobs table)          │
-        └──────────────────────┬───────────────────────┘
-                               │  polled every poll-interval-ms
-                    ┌──────────▼───────────┐
-                    │ JobPollingScheduler   │  only runs on the elected leader
-                    └──────────┬───────────┘
-                               │
-                    ┌──────────▼───────────┐
-                    │  PriorityJobQueue     │  in-memory, priority + due-time ordered
-                    └──────────┬───────────┘
-                               │
-                    ┌──────────▼───────────┐
-                    │  SchedulerService     │  leader election, job claiming, crash recovery
-                    └──────────┬───────────┘
-                               │
-                    ┌──────────▼───────────┐
-                    │   JobDispatcher       │  async dispatch, records execution lifecycle
-                    └──────────┬───────────┘
-                               │
-                    ┌──────────▼───────────┐
-                    │    TaskExecutor       │  runs the task with a timeout
-                    └──────────┬───────────┘
-                               │
-                 success ──────┴────── failure
-                    │                      │
-          ┌─────────▼────────┐   ┌─────────▼─────────┐
-          │  RetryService     │   │   RetryService      │
-          │ (reschedule/      │   │ (backoff + retry,   │
-          │  complete)        │   │  or mark FAILED)    │
-          └───────────────────┘   └────────────────────┘
+                       ┌──────────────────────── REST API (any node) ───────────────────────┐
+   curl / client ────► │ scheduler-1 :8081  (leader)        scheduler-2 :8082  (standby)    │
+                       └───────┬──────────────────────────────────────┬─────────────────────┘
+                               │ lease election, claim jobs,          │ same code, same DB;
+                               │ crash recovery, dispatch             │ takes over if leader dies
+                               ▼                                      ▼
+                       ┌──────────────────────── PostgreSQL ───────────────────────────────┐
+                       │ scheduler_leader │ jobs │ job_executions │ workers                │
+                       └────────────────────────────────────────────────────────────────────┘
+                               │ POST /internal/execute (push)           ▲ register / heartbeat /
+                               ▼                                         │ result  (any scheduler node)
+                 worker-1 :8091     worker-2 :8092     worker-3 :8093
 ```
- 
-Two supporting concerns run alongside this pipeline:
- 
-- **`WorkerRegistrationService` / `HeartbeatService`** — track worker nodes, detect stale/dead ones, and feed worker selection.
-- **`SchedulerService.participateInLeaderElection()`** — a recurring, lease-based conditional update that elects and renews a single leader node; if the leader crashes, its lease expires and another node takes over automatically. The leader lease duration itself (15 seconds) is currently a fixed constant in `SchedulerService`, not an `application.yml` setting — only the *job* lease duration (`lease-duration-seconds`) is externally configurable.
-## Job lifecycle
- 
-**Job status** (overall state of a job):
- 
-| Status | Meaning |
+
+## Run it
+
+Requires Docker + Docker Compose v2.
+
+```bash
+docker compose up --build
+```
+
+| Service      | Port | Role                                   |
+|--------------|------|----------------------------------------|
+| scheduler-1  | 8081 | API + leader-eligible                  |
+| scheduler-2  | 8082 | API + leader-eligible                  |
+| worker-1/2/3 | 8091 / 8092 / 8093 | execute jobs             |
+| postgres     | 5432 | state (db/user/password: `scheduler`)  |
+
+```bash
+./scripts/demo.sh                      # creates one job of every type
+curl -s localhost:8081/api/cluster/status | jq
+```
+
+Without Docker (needs Java 17, Maven, a local Postgres): `mvn package -DskipTests`, then start
+`scheduler/target/app.jar` (env `NODE_ID`, `SERVER_PORT`, `DB_URL`...) and `worker/target/app.jar`
+(env `WORKER_ID`, `SERVER_PORT`, `SCHEDULER_URLS`...).
+
+## Features and how they work
+
+| Feature | Implementation |
 |---|---|
-| `PENDING` | Waiting for its next trigger time |
-| `RUNNING` | Currently leased and dispatched to a worker |
-| `COMPLETED` | Terminal state for one-time/delayed jobs that finished successfully |
-| `RETRY` | Failed; waiting for the next backoff-delayed attempt |
-| `FAILED` | Exhausted all retry attempts (dead letter) |
-| `CANCELLED` | Explicitly cancelled by the user |
-| `TIMEOUT` | Execution exceeded its allowed duration |
-| `PAUSED` | Paused by the user; skipped by the scheduler until resumed |
- 
-**Job type** (how the next run time is computed):
- 
-| Type | Behavior |
-|---|---|
-| `ONE_TIME` | Executes once at a specific `scheduledAt` timestamp |
-| `DELAYED` | Executes once, after an initial delay from creation time |
-| `RECURRING` | Executes every `fixedIntervalSeconds` after the previous run |
-| `CRON` | Next run computed from a cron expression |
- 
+| **Job types** | `ONE_TIME` (optionally `runAt`), `DELAYED` (`delaySeconds`), `FIXED_INTERVAL` (`intervalSeconds`), `CRON` (6-field Spring cron, UTC) |
+| **Priority dispatch** | `ORDER BY priority DESC, next_run_at ASC` (priority 1–10, 10 = highest, default 5) |
+| **Leader election** | Single-row `scheduler_leader` table. `UPDATE ... WHERE node_id = me OR lease_expires_at < now()` — exactly one node can win; leader renews every poll tick (1s) with a 10s lease. Uses the **DB clock**, so node clock skew is irrelevant. `term` is a fencing counter. Graceful shutdown releases the lease instantly. |
+| **Optimistic claiming** | `UPDATE jobs SET status='RUNNING' ... WHERE id=? AND status='PENDING' AND next_run_at<=now()` — 1 row updated = you own it. Protects against double-dispatch even during a leader hand-over. |
+| **Crash recovery** | Every RUNNING job has `lease_expires_at = now + timeout + 15s`. The leader resets expired jobs to `PENDING` (and marks the execution `LOST`). Jobs of a worker declared `DEAD` are reset immediately. |
+| **Retry + backoff** | On failure: `backoff = min(base * 2^(n-1), 300s)`. After `maxRetries` retries the job becomes terminal `FAILED` (dead letter) with `lastError`. |
+| **Execution history** | Every attempt is an append-only row in `job_executions` (`RUNNING → SUCCESS / FAILED / LOST`), `GET /api/jobs/{id}/executions`. |
+| **Workers** | Register on startup, heartbeat every 3s, marked `DEAD` after 15s silence; revive automatically on the next heartbeat. Least-loaded worker gets the next job; each worker has a concurrency `capacity` (default 4) and returns HTTP 429 when full. |
+| **Failover** | Workers know all scheduler URLs and fail over between them for register / heartbeat / result calls. |
+
+Job lifecycle: `PENDING → RUNNING → COMPLETED | FAILED`, recurring jobs go back to `PENDING`;
+`PAUSED` and `CANCELLED` are set by the user.
+
 ## REST API
- 
-### Jobs — `/api/jobs`
- 
+
 | Method | Path | Description |
 |---|---|---|
-| `POST` | `/api/jobs` | Create a new job |
-| `GET` | `/api/jobs/{id}` | Get a job by ID |
-| `GET` | `/api/jobs?status={status}` | List jobs, optionally filtered by status |
-| `POST` | `/api/jobs/{id}/cancel` | Cancel a job |
-| `POST` | `/api/jobs/{id}/pause` | Pause a job |
-| `POST` | `/api/jobs/{id}/resume` | Resume a paused job |
-| `GET` | `/api/jobs/{id}/executions` | Get execution history for a job |
- 
-Example request body for creating a job:
- 
+| POST | `/api/jobs` | create a job |
+| GET | `/api/jobs?status=&limit=&offset=` | list |
+| GET | `/api/jobs/{id}` | get |
+| PUT | `/api/jobs/{id}` | update (only `PENDING` / `PAUSED`) |
+| DELETE | `/api/jobs/{id}` | delete (not while `RUNNING`) |
+| POST | `/api/jobs/{id}/cancel` / `pause` / `resume` | lifecycle control |
+| GET | `/api/jobs/{id}/executions` | attempt history |
+| GET | `/api/cluster/status` | this node, leader, workers, job counts |
+| GET | `/api/cluster/leader` / `workers` | monitoring |
+| GET | `/actuator/health` | health (both node types) |
+
+Create-job body:
+
 ```json
 {
-  "name": "nightly-report",
-  "jobType": "CRON",
-  "taskHandler": "reportGenerator",
+  "name": "nightly-cleanup",
+  "handlerType": "LOG",
+  "payload": { "message": "hi" },
+  "scheduleType": "CRON",
   "cronExpression": "0 0 2 * * *",
-  "priority": 5,
+  "priority": 7,
   "maxRetries": 3,
-  "timeoutSeconds": 120
+  "backoffSeconds": 5,
+  "timeoutSeconds": 60
 }
 ```
- 
-`maxRetries` is set **per job** (defaulting to 5 if omitted) — retry limits are not controlled globally; see the configuration note below.
- 
-### Workers — `/api/workers`
- 
-| Method | Path | Description |
+`delaySeconds` for `DELAYED`, `intervalSeconds` for `FIXED_INTERVAL`, `runAt` (ISO-8601) for `ONE_TIME`.
+
+### Built-in job handlers (`handlerType`)
+
+| Type | Payload | Behaviour |
 |---|---|---|
-| `GET` | `/api/workers` | List all registered workers |
-| `GET` | `/api/workers/leader` | Get the currently elected leader node |
- 
-Worker lifecycle (registration, heartbeats, leader election) is internal and driven by background services — it is not exposed as a mutable resource over the API.
- 
-## Tech stack
- 
-- **Java 17**, **Spring Boot 3.2.5**
-- **Spring Data JPA** + **PostgreSQL**
-- **Flyway** for schema migrations
-- **Spring Validation** for request validation
-- **Spring Actuator** for health/metrics
-- **Lombok** for boilerplate reduction
-- **Testcontainers** + **JUnit 5** for integration testing against a real Postgres instance
-## Project structure
- 
-```
-Distributed_Job_Scheduler
-├── src
-│   ├── main
-│   │   ├── java/com/jobscheduler
-│   │   │   ├── config          # Async, scheduler, and thread-pool configuration
-│   │   │   ├── controller      # REST controllers
-│   │   │   ├── dispatcher      # Job dispatch + task execution
-│   │   │   ├── dto             # Request/response payloads
-│   │   │   ├── entity          # JPA entities and enums
-│   │   │   ├── exception       # Custom exceptions + global handler
-│   │   │   ├── mapper          # Entity <-> DTO mapping
-│   │   │   ├── repository      # Spring Data repositories
-│   │   │   ├── scheduler       # Polling loop, cron evaluation, priority queue
-│   │   │   ├── service         # Job, retry, and scheduler coordination services
-│   │   │   ├── util            # Cron parsing helpers
-│   │   │   ├── worker          # Worker registration + heartbeat services
-│   │   │   └── SchedulerApplication.java
-│   │   └── resources
-│   │       ├── db/migration    # Flyway SQL migrations
-│   │       └── application.yml
-│   └── test
-├── pom.xml
-└── README.md
-```
- 
-## Configuration
- 
-Key settings in `application.yml` (all overridable via environment variables):
- 
-```yaml
-scheduler:
-  node-id: ${SCHEDULER_NODE_ID:node-1}
-  poll-interval-ms: 5000        # how often the scheduler scans for due jobs
-  batch-size: 50                # max jobs fetched per poll cycle
-  lease-duration-seconds: 30    # how long a claimed job's lease is valid
-  heartbeat-interval-ms: 10000
-  heartbeat-timeout-seconds: 30
-  retry-base-delay-seconds: 2   # base for exponential backoff: base * 2^attempt
- 
-thread-pool:
-  dispatcher-core-size: 10
-  dispatcher-max-size: 50
-  dispatcher-queue-capacity: 200
-  worker-core-size: 20
-  worker-max-size: 100
-  worker-queue-capacity: 500
-```
- 
-> **Note:** an earlier version of this file also listed `scheduler.max-retry-attempts` as a global setting. It has been removed here because it isn't actually read anywhere in the codebase — the real retry ceiling is `Job.maxRetries`, set per job at creation time (via the `maxRetries` field on the create-job request body, defaulting to 5). If you want a true global default/cap, that would need to be wired into `JobMapper`/`JobRequest` explicitly; right now it's each job's own setting only.
- 
-Database connection defaults to a local PostgreSQL instance:
- 
-```yaml
-spring:
-  datasource:
-    url: jdbc:postgresql://localhost:5432/jobscheduler
-    username: postgres
-    password: postgres
-```
- 
-## Getting started
- 
-### Prerequisites
- 
-- Java 17+
-- Maven 3.8+
-- PostgreSQL 14+ (running locally, or via Docker — see below)
-### Setup (single node)
- 
-1. Start PostgreSQL. Either a local install:
+| `LOG` | `{"message": "..."}` | logs a message |
+| `SLEEP` | `{"seconds": 5}` | simulates long work |
+| `HTTP` | `{"url": "https://..."}` | GET; non-2xx = failure |
+| `FAIL` | `{"message": "..."}` | always fails (retry / dead-letter demo) |
+| `FLAKY` | `{"failureRate": 0.5}` | random failures |
+| `CRASH` | – | kills the worker JVM mid-job (crash-recovery demo) |
+
+Add your own: implement `JobHandler` in `worker/.../handler/` and annotate it with `@Component`.
+
+## Try the failure scenarios
+
 ```bash
-   createdb jobscheduler
+# 1. Leader failover: find the leader, stop it, watch the other take over (~10s, or instantly on graceful stop)
+curl -s localhost:8082/api/cluster/leader
+docker compose stop scheduler-1
+curl -s localhost:8082/api/cluster/leader        # scheduler-2, term incremented
+# the API keeps working on :8082 and workers fail over automatically
+
+# 2. Crash recovery: this job kills the worker that runs it
+curl -s -X POST localhost:8082/api/jobs -H 'Content-Type: application/json' \
+  -d '{"name":"crasher","handlerType":"CRASH","scheduleType":"ONE_TIME"}'
+# after ~15s the worker is DEAD, the job goes back to PENDING and a surviving worker picks it up
+# (it will crash that one too - it's a poison pill; cancel it with POST /api/jobs/{id}/cancel)
+curl -s localhost:8082/api/cluster/workers
+
+# 3. Retry with backoff -> dead letter
+curl -s -X POST localhost:8082/api/jobs -H 'Content-Type: application/json' \
+  -d '{"name":"bad","handlerType":"FAIL","scheduleType":"ONE_TIME","maxRetries":3,"backoffSeconds":2}'
+curl -s localhost:8082/api/jobs/<id>/executions | jq    # 4 attempts, spaced ~2s, 4s, 8s; job ends FAILED
+
+# 4. Bring a worker back
+docker compose start worker-1
 ```
- 
-   or via Docker:
- 
-```bash
-   docker run -d --name jobscheduler-pg -p 5432:5432 \
-     -e POSTGRES_DB=jobscheduler -e POSTGRES_USER=postgres -e POSTGRES_PASSWORD=postgres \
-     postgres:16-alpine
+
+## Configuration (env vars)
+
+Scheduler: `NODE_ID`, `SERVER_PORT`, `DB_URL`, `DB_USER`, `DB_PASSWORD`, `LEADER_LEASE_SECONDS` (10),
+`POLL_INTERVAL_MS` (1000), `WORKER_DEAD_AFTER_SECONDS` (15).
+Worker: `WORKER_ID`, `WORKER_HOST` (address the scheduler uses to reach it), `SERVER_PORT`, `WORKER_CAPACITY` (4),
+`SCHEDULER_URLS` (comma-separated), `HEARTBEAT_INTERVAL_MS` (3000).
+
+To add a 4th worker, copy a `worker-*` block in `docker-compose.yml` with a new `WORKER_ID`, `WORKER_HOST`
+and `SERVER_PORT`.
+
+## Project layout
+
 ```
- 
-2. Build and run:
-```bash
-   mvn clean install
-   mvn spring-boot:run
+common/      shared DTOs (DispatchRequest, ExecutionResult, WorkerRegistration)
+scheduler/   REST API, LeaderElectionService, SchedulerLoop, JobDispatcher, RecoveryService, JDBC repositories, schema.sql
+worker/      registration/heartbeat, /internal/execute, JobRunner (pool + timeout), pluggable JobHandlers
 ```
- 
-   Flyway will automatically apply the migrations in `src/main/resources/db/migration` on startup.
- 
-3. The API is available at `http://localhost:8080`.
-### Running a multi-node cluster (recommended — this is the actual point of the project)
- 
-A single instance behaves like an ordinary scheduler; running more than one is what exercises the leader election, optimistic claiming, and crash-recovery logic this project is actually built around. No code changes are needed — `server.port` and `scheduler.node-id` are both externally overridable.
- 
-1. Build the jar once:
-```bash
-   mvn clean package -DskipTests
-```
- 
-2. Launch multiple instances against the **same** database, each with a distinct port and node ID:
-```bash
-   java -jar target/*.jar --server.port=8080 --scheduler.node-id=node-1
-   java -jar target/*.jar --server.port=8081 --scheduler.node-id=node-2
-   java -jar target/*.jar --server.port=8082 --scheduler.node-id=node-3
-```
- 
-   Run each in its own terminal window (or use a small shell/batch script to launch all three at once).
- 
-3. Verify the cluster formed correctly:
-```bash
-   curl http://localhost:8080/api/workers          # should list all 3 nodes
-   curl http://localhost:8080/api/workers/leader    # exactly one should have isLeader: true
-```
- 
-4. Create a job on any node's port — only the current leader's logs will show it being claimed and dispatched. Kill that leader's process and re-check `/api/workers/leader` after ~15–25 seconds to see automatic failover to a surviving node.
-### Running tests
- 
-```bash
-mvn test
-```
- 
-Integration tests spin up a real PostgreSQL container via Testcontainers rather than an in-memory database, so Flyway migrations, JPA mappings, and scheduled beans are validated against the actual target engine.
- 
-## Design notes and trade-offs
- 
-- **Polling vs. push** — the scheduler polls the database on a fixed delay rather than reacting to a push/event source. This keeps the system simple and self-healing (a missed cycle just gets picked up on the next poll) at the cost of some latency and constant idle DB load. A message-broker-driven push model is a natural upgrade path.
-- **Leader election without a consensus system** — leadership is decided with a lease-based conditional UPDATE against PostgreSQL rather than ZooKeeper, etcd, or Consul. This teaches the core concept (lease + fencing via expiry) without extra infrastructure, but it is not linearizable across network partitions the way a proper Raft/Paxos-based system would be. As a defense-in-depth backstop, the `workers` table also has a database-level partial unique index enforcing that at most one row can ever have `is_leader = true`, independent of the application-level logic.
-- **In-process workers** — "workers" currently execute as thread-pool tasks within the same JVM rather than as separate networked nodes. The worker registry, heartbeat, and selection logic are still fully modeled, so swapping the execution layer for an RPC call to real remote workers is a contained change.
-- **At-least-once execution** — recovered leases are reset to `PENDING` and re-run rather than guaranteed exactly-once. Task handlers are expected to be idempotent.
-- **Dead letter queue as a status, not a queue** — jobs that exhaust their retries simply move to `FAILED`. This keeps PostgreSQL as the single source of truth instead of introducing a separate physical dead-letter queue.
+
+## Design notes and limits
+
+* **At-least-once delivery.** If a worker finishes a job but dies before reporting, or a lease expires on a slow job,
+  the job can run again. Make handlers idempotent.
+* A cancelled `RUNNING` job is not interrupted on the worker; its late result is recorded but ignored.
+* Cron expressions are evaluated in UTC. A recurring job whose schedule was missed (e.g. while paused) skips the
+  missed fires and runs at the next one.
+* Leader election is only as available as PostgreSQL. For production you would add a Postgres HA setup,
+  authentication on the `/internal` endpoints, and metrics/alerting.
